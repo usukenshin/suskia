@@ -9,6 +9,7 @@ with clear transitions between the conversation states.
 """
 
 from __future__ import annotations
+from config import bot_token
 
 import logging
 import random
@@ -394,8 +395,7 @@ async def cancel_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return ConversationHandler.END
 
 
-def main() -> None:
-    bot_token = "YOUR_BOT_TOKEN"
+def main(bot_token) -> None:
 
     application = ApplicationBuilder().token(bot_token).build()
 
@@ -418,4 +418,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(bot_token)
