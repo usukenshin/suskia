@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from config import bot_token
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -235,6 +235,7 @@ class GameSession:
     word_pair: Optional[tuple[str, str]] = None
     name_order: List[int] = field(init=False)
     next_name_index: int = 0
+    name_prompt_message_id: Optional[int] = None
 
     def __post_init__(self) -> None:
         self.players = {
@@ -432,6 +433,7 @@ def build_elimination_keyboard(session: GameSession) -> InlineKeyboardMarkup:
 async def prompt_next_name(message: Message, session: GameSession) -> int:
     seat = session.current_name_seat()
     if seat is None:
+        session.name_prompt_message_id = None
         await message.reply_text(
             "All names registered! Choose the role distribution for this round:",
         )
@@ -442,9 +444,14 @@ async def prompt_next_name(message: Message, session: GameSession) -> int:
         return ROLE_SELECTION
 
     player = session.players[seat]
-    await message.reply_text(
-        f"Send the name for Player {seat} (current: {player.name}). Use /skip to keep it.",
+    prompt = await message.reply_text(
+        f"Reply to this message with the name for Player {seat} (current: {player.name}). Use /skip to keep it.",
+        reply_markup=ForceReply(
+            selective=False,
+            input_field_placeholder=f"Player {seat} name",
+        ),
     )
+    session.name_prompt_message_id = prompt.message_id
     return NAMING_PLAYERS
 
 
@@ -492,6 +499,22 @@ async def capture_player_name(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not session:
         await update.message.reply_text("Game session not found. Start a new game with /start.")
         return ConversationHandler.END
+
+    chat = update.effective_chat
+    if chat and chat.type in {"group", "supergroup"}:
+        prompt_id = session.name_prompt_message_id
+        if not prompt_id:
+            await update.message.reply_text(
+                "Please wait for the next naming prompt before sending a name.",
+            )
+            return NAMING_PLAYERS
+
+        reply = update.message.reply_to_message
+        if not reply or reply.message_id != prompt_id:
+            await update.message.reply_text(
+                "Reply to the bot's latest prompt to register the next player's name.",
+            )
+            return NAMING_PLAYERS
 
     name = update.message.text.strip()
     if not name:
