@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from config import bot_token
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -26,6 +28,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.error import Forbidden, TelegramError
 
 # Enable logging so it is easier to debug when the bot is running live.
 logging.basicConfig(
@@ -218,6 +221,7 @@ class Player:
     eliminated: bool = False
     card: Optional[int] = None
     score: int = 0
+    telegram_id: Optional[int] = None
 
 
 @dataclass
@@ -233,6 +237,7 @@ class GameSession:
     word_pair: Optional[tuple[str, str]] = None
     name_order: List[int] = field(init=False)
     next_name_index: int = 0
+    name_prompt_message_id: Optional[int] = None
 
     def __post_init__(self) -> None:
         self.players = {
@@ -288,12 +293,23 @@ class GameSession:
             player.word = ""
 
     # --- helpers for card selection --------------------------------------------------
-    def register_card_choice(self, card_value: int) -> Player:
+    def register_card_choice(self, card_value: int, user_id: int) -> Player:
         seat = self.pending_seats.pop(0)
         player = self.players[seat]
         player.card = card_value
         self.available_cards.remove(card_value)
+        player.telegram_id = user_id
         return player
+
+    def revert_card_choice(self, player: Player, previous_user: Optional[int]) -> None:
+        """Restore the last pending seat and card if a reveal could not be delivered."""
+
+        self.pending_seats.insert(0, player.seat)
+        if player.card is not None:
+            self.available_cards.append(player.card)
+            self.available_cards.sort()
+        player.card = None
+        player.telegram_id = previous_user
 
     # --- helpers for elimination -----------------------------------------------------
     def active_players(self) -> List[Player]:
@@ -419,6 +435,7 @@ def build_elimination_keyboard(session: GameSession) -> InlineKeyboardMarkup:
 async def prompt_next_name(message: Message, session: GameSession) -> int:
     seat = session.current_name_seat()
     if seat is None:
+        session.name_prompt_message_id = None
         await message.reply_text(
             "All names registered! Choose the role distribution for this round:",
         )
@@ -429,9 +446,14 @@ async def prompt_next_name(message: Message, session: GameSession) -> int:
         return ROLE_SELECTION
 
     player = session.players[seat]
-    await message.reply_text(
-        f"Send the name for Player {seat} (current: {player.name}). Use /skip to keep it.",
+    prompt = await message.reply_text(
+        f"Reply to this message with the name for Player {seat} (current: {player.name}). Use /skip to keep it.",
+        reply_markup=ForceReply(
+            selective=False,
+            input_field_placeholder=f"Player {seat} name",
+        ),
     )
+    session.name_prompt_message_id = prompt.message_id
     return NAMING_PLAYERS
 
 
@@ -479,6 +501,22 @@ async def capture_player_name(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not session:
         await update.message.reply_text("Game session not found. Start a new game with /start.")
         return ConversationHandler.END
+
+    chat = update.effective_chat
+    if chat and chat.type in {"group", "supergroup"}:
+        prompt_id = session.name_prompt_message_id
+        if not prompt_id:
+            await update.message.reply_text(
+                "Please wait for the next naming prompt before sending a name.",
+            )
+            return NAMING_PLAYERS
+
+        reply = update.message.reply_to_message
+        if not reply or reply.message_id != prompt_id:
+            await update.message.reply_text(
+                "Reply to the bot's latest prompt to register the next player's name.",
+            )
+            return NAMING_PLAYERS
 
     name = update.message.text.strip()
     if not name:
@@ -553,6 +591,10 @@ async def select_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await query.edit_message_text("Game session not found. Start a new game with /start.")
         return ConversationHandler.END
 
+    if not session.pending_seats:
+        await query.answer("All cards have already been drawn.", show_alert=True)
+        return CARD_SELECTION
+
     try:
         card_value = int(query.data.split(":", 1)[1])
     except (ValueError, IndexError):
@@ -563,17 +605,60 @@ async def select_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await query.answer("Card already taken. Pick another one.", show_alert=True)
         return CARD_SELECTION
 
-    player = session.register_card_choice(card_value)
-    await query.edit_message_text(f"{player.name} chose card {card_value}.")
+    seat = session.pending_seats[0]
+    player = session.players[seat]
+
+    user_id = query.from_user.id
+    if player.telegram_id and player.telegram_id != user_id:
+        await query.answer(
+            f"It's {player.name}'s turn to draw. Ask them to pick their card.",
+            show_alert=True,
+        )
+        return CARD_SELECTION
+
+    previous_user = player.telegram_id
+    player = session.register_card_choice(card_value, user_id)
+
+    proposed_name = player.name
+    if player.name.startswith("Player "):
+        proposed_name = query.from_user.full_name or player.name
 
     if player.role == "W":
-        await query.message.reply_text(
-            f"{player.name}, you are Mr. White! Improvise without a word.",
-        )
+        dm_lines = [
+            f"Hi {query.from_user.first_name or proposed_name}!",
+            "You are Mr. White this round.",
+            "You received no secret word—listen carefully and improvise!",
+        ]
     else:
-        await query.message.reply_text(
-            f"{player.name}, your word is {player.word}.",
+        dm_lines = [
+            f"Hi {query.from_user.first_name or proposed_name}!",
+            f"Your secret word is: {player.word}",
+            "Keep it to yourself and describe it carefully during the discussion.",
+        ]
+
+    try:
+        await context.bot.send_message(chat_id=user_id, text="\n".join(dm_lines))
+    except Forbidden:
+        session.revert_card_choice(player, previous_user)
+        await query.answer(
+            "I couldn't send you the word. Start a private chat with me and tap the card again.",
+            show_alert=True,
         )
+        return CARD_SELECTION
+    except TelegramError as exc:
+        session.revert_card_choice(player, previous_user)
+        logger.exception("Failed to send secret word to user %s", user_id, exc_info=exc)
+        await query.answer(
+            "Something went wrong while sending your word. Please try again.",
+            show_alert=True,
+        )
+        return CARD_SELECTION
+
+    player.name = proposed_name
+
+    await query.edit_message_text(
+        f"{player.name} drew card {card_value}. Check your private messages!",
+    )
 
     if session.pending_seats:
         next_seat = session.pending_seats[0]
