@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from config import bot_token
+
 from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
